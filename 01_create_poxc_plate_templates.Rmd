@@ -1,0 +1,259 @@
+---
+title: "Create POXC plate templates"
+author: "Hava Blair"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+---
+
+## Overview
+
+This R Markdown document takes (1) absorbance data from the plate reader and (2) plate maps typed by hand, and combines them into templates to be used in the next step, `02_poxc_calculation.Rmd` We are creating templates specifically to use with the 'plater' package.
+
+To start:
+
+(1) save absorbance data from plate reader as .xlsx files in raw_data dir
+
+(2) Type up plate maps as shown in "raw_data/plate_maps.csv".
+    All maps in 1 file.
+    Make sure plate map names match sheet names in absorbance .xlsx files.
+    Save in raw_data dir
+
+There are two ways to use this code: "one-by-one" or "loop".
+
+For "one-by-one" you can call the function make_poxc_plater_template() once for each .xlsx file you wish to turn into plater templates.
+
+For "loop" you make a list of multiple .xslx to be templated and pass it to make_poxc_plater_template() with the walk() function.
+See below in "make templates" section.
+
+AFTER running this script: be careful about overwriting templates once you've started to enter "bad wells" info by hand from lab notes.
+This would happen in the case where you have already run this script once, but then run it again on the same input file (for whatever reason).
+This is easily avoided by renaming the templates folder after you've run the script successfully the first time, or supplying a different dir name in the "make dir if needed" section if you plan to run the script multiple times.
+
+## Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(dplyr)
+library(glue)
+library(readr)
+library(tidyr)
+library(purrr)
+library(readxl)
+```
+
+## Custom functions
+
+**Thing you might need to change**: depending on when you ran your plates, the specific "rectangle" in the Excel sheet where your absorbance data lives might be different.
+This happens in particular when different people adjust the plate reader protocol settings.
+Double check your data before running this, and update the value of `excel_plate_rect` below.
+
+Here I'm building up some functions and data structures we'll use to make our templates.
+I did it this way because it's pretty common for me to process multiple plates worth of data at the same time, and wrapping this code in function(s) is a way to avoid repeating the lines over and over for each plate.
+
+This code block doesn't return anything explicitly, but it adds the data and functions to your local environment for use later in the process.
+
+```{r}
+# does NOT include plate header w/ numbers. DOES include 
+# row names with letters. Also includes one empty row (the one
+# below H). Should be 8 rows high and 13 columns wide.
+excel_plate_rect <- "B24:N32"
+
+
+# creating an empty template section for marking bad wells 
+bad_empty_df <- data.frame(
+  "letter" = LETTERS[1:8],
+  "1" = rep("", 8),
+  "2" = rep("", 8),
+  "3" = rep("", 8),
+  "4" = rep("", 8),
+  "5" = rep("", 8),
+  "6" = rep("", 8),
+  "7" = rep("", 8),
+  "8" = rep("", 8),
+  "9" = rep("", 8),
+  "10" = rep("", 8),
+  "11" = rep("", 8),
+  "12" = rep("", 8)
+)
+
+colnames(bad_empty_df) <- c("letter",
+                            "1",
+                            "2",
+                            "3",
+                            "4",
+                            "5",
+                            "6",
+                            "7",
+                            "8",
+                            "9",
+                            "10",
+                            "11",
+                            "12")
+
+# gets used in the "make_poxc_plater_temp()" function below
+make_template <- function(plate_map, abs_data) {
+  # make sure all cols are character
+  abs_map <- dplyr::bind_rows(abs_data, plate_map)
+  
+  abs_map[nrow(abs_map) + 1, ] <- NA
+  
+  abs_map[nrow(abs_map) + 1, ] <-
+    list("bad_wells",
+         "1",
+         "2",
+         "3",
+         "4",
+         "5",
+         "6",
+         "7",
+         "8",
+         "9",
+         "10",
+         "11",
+         "12")
+  
+  temp <- dplyr::bind_rows(abs_map, bad_empty_df)
+  
+  temp <- temp %>%
+    dplyr::rename(abs = letter)
+  
+  
+  return(temp)
+}
+
+# gets used in the "make_poxc_plater_temp()" function below
+write_template <- function(plate_name, template) {
+  path <- glue::glue("./templates/{plate_name}_plater_template.csv")
+  
+  readr::write_csv(template, path, na = "")
+  
+}
+
+
+make_poxc_plater_temp <- function(target_path) {
+  # plate maps -----------------------------------------
+  
+  maps <-
+    readr::read_csv("raw_data/plate_maps.csv", col_types = "cccccccccccccc")
+  
+  # fill in plate names, drop blank lines, nest by plate
+  plate_map_df <- maps %>%
+    tidyr::fill(plate_id, .direction = "down") %>% #fill plate name down
+    dplyr::filter(!is.na(letter)) %>% # drop blank rows between plates
+    dplyr::group_by(plate_id) %>%
+    tidyr::nest() %>%
+    dplyr::rename(plate_map = data)
+  
+  
+  # absorbance data ----------------------------------
+  
+  sheets <- readxl::excel_sheets(target_path)
+  
+  path_sheet_df <- data.frame(path = target_path, sheets = sheets)
+  
+  # purposely including empty line N32
+  abs_df <-
+    path_sheet_df %>% dplyr::mutate(abs_data = purrr::map2(
+      path,
+      sheets,
+      ~ readxl::read_excel(
+        path = .x,
+        sheet = .y,
+        # defined at top of this code chunk
+        range = excel_plate_rect,
+        col_names = c(
+          "letter",
+          "1",
+          "2",
+          "3",
+          "4",
+          "5",
+          "6",
+          "7",
+          "8",
+          "9",
+          "10",
+          "11",
+          "12"
+        ),
+        col_types = "text"
+      )
+    ))
+  
+  
+  # join and save as csv ------------------------------
+  
+  abs_map_df <-
+    dplyr::left_join(abs_df, plate_map_df, by = c("sheets" = "plate_id"))
+  
+  
+  temp_df <- abs_map_df %>%
+    dplyr::mutate(template = purrr::map2(plate_map, abs_data, make_template))
+  
+  
+  plate_names <- temp_df$sheets
+  
+  template_list <- temp_df$template
+  
+  purrr::walk2(plate_names, template_list, write_template)
+  
+  
+}
+
+```
+
+## Create folder for templates
+
+Ensures you have a folder named "templates". You don't need to specify a different directory name if you already have a "templates" folder, but you can (if you are testing/changing this script for example, and want to compare outputs).
+
+**Be careful** if you are running this multiple times in one day, that you don't overwrite files after you've started editing them by hand to add "bad well" info from your lab notebook. 
+
+
+```{r}
+
+
+# dir = directory = folder
+if (dir.exists("templates")){ 
+  
+  print("templates dir exists, would you like to specify a different dir name?")
+  
+}else{
+  # can change this name if desired
+  dir.create(glue("templates"))
+}
+
+```
+
+
+## Make templates from one .xlsx file
+
+```{r}
+
+# provide the path to your excel file w/ absorbance data 
+# from the plate reader. 
+make_poxc_plater_temp("./raw_data/abs_POXC_CIG_HB_20211217.xlsx")
+
+```
+
+## Make templates from multiple .xslx files
+
+```{r}
+
+# Loop example
+# paths to .xlsx files with abs data from plate reader
+paths_to_abs_data <- list.files("raw_data",
+                                # pulls all files processed
+                                # in Dec of 2021
+                                pattern = "202112",
+                                full.names = TRUE)
+
+# loops through list of paths, saves templates as csv files
+walk(paths_to_abs_data, make_poxc_plater_temp) 
+```
+
+## Next
+
+-   Go to your lab notebook, review notes, and mark "bad" wells in the plater templates you just created (can mark with any text: X, bad well, x, etc.). Save the updated templates.
+-   Be careful if you are testing / running this multiple times with the same input file that you don't overwrite templates you've edited by hand with new blank ones made by this script.
+-   Go to `02_poxc_calculation.Rmd`.

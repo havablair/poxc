@@ -1,0 +1,325 @@
+---
+title: "POXC Data Processing"
+author: "Hava Blair"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+```{r setup, echo=FALSE, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(tidy = TRUE)
+knitr::opts_chunk$set(tidy.opts = list(width.cutoff=60))
+
+library(tidyverse)
+library(glue)
+library(plater)
+library(readxl) 
+
+# for my date stamp on exported data
+today <- lubridate::today() %>% str_replace_all("-", "")
+
+```
+
+## Overview
+
+Assumes you have already generated `plater` templates with `01_create_poxc_plate_templates.Rmd`
+
+Also assumes that between making the templates and running this script, you have added any relevant info from your lab notebook (bad wells, suspected contamination, etc.) to the "bad_wells" part of the templates you made.
+
+This can be used to run calculations for many plates at once, or you can specify individual plates by the path to their template below in the "Load Data" Section
+
+### Equations
+
+Adapted from Appendix 5 of *Stott, D.E. 2019. Recommended Soil Health Indicators and Associated Laboratory Procedures. Soil Health Technical Note No. 450-03. U.S. Department of Agriculture, Natural Resources Conservation Service.*
+
+To create the standard curve for each plate, determine the slope (b) and y-intercept (a) of a linear regression equation with concentration as the dependent variable (y) and absorbance as the independent variable (x)
+
+conc = a + b\*abs
+
+Active C (mg/kg) = [0.02 mol/L - (a + b \* abs)] \* (9000 mg C /mol) \* (0.02 L solution / mass soil kg)
+
+Where:
+
+-   **0.02 mol/L** is the initial solution concentration\
+-   **a** is std curve intercept, **b** is std curve slope, **(a + b \* absorbance)** is the post-reaction concentration\
+-   **9000 mg** of C (0.75 mol) is assumed to be oxidized by 1 mol of MnO4 changing from Mn7+ to Mn2+\
+-   **0.02 L** is the volume of KMnO4 solution reacted with soil (2 mL 0.2M KMnO4 stock + 18 mL DDI water = 20mL (0.02L) 0.02M solution)\
+-   **0.0025 kg** is the weight of soil used (plug in actual mass from weigh sheets)
+
+## Load data
+
+```{r load, message=FALSE, warning=FALSE}
+
+# pull file paths to everything in "templates" folder
+# use the "pattern" argument if you want to run specific templates insated of all
+tmp_paths <- list.files("templates", full.names = TRUE)
+
+# list of plate names to pass to "read_plates"
+# recall that these were extracted from the tab names
+# in our original .xlsx data files.
+pnames <- basename(tmp_paths) %>% str_replace("_plater_template.csv", "")
+
+# read in the plates, drop bad wells
+abs_df <- read_plates(files = tmp_paths, plate_names = pnames, well_ids_column = "wells") %>% 
+  mutate(bad_wells = as.character(bad_wells),
+    bad_wells = case_when(
+    is.na(bad_wells) ~ "ok",
+    TRUE ~ bad_wells
+  )) %>%
+  filter(!is.na(bad_wells)) # drop bad wells
+
+
+abs_df <- abs_df %>% rename(plate_id = Plate)
+
+sample_mass <- read_csv("raw_data/poxc_soil_mass.csv") %>% 
+  mutate(mass_kg = mass/1000) %>% 
+  select(-c(weigh_date, person, mass)) %>% 
+  rename(id = sample_id)
+
+names <- read_csv("raw_data/cig_names_master.csv") %>% 
+  rename(id = sample_id)
+
+```
+
+## Subtract water blank
+
+The Culman KBS protocol indicates to subtract the average of the DDI water blank from all absorbance values before performing any calculations.
+The NRCS Tech Note protocol doesn't mention this.
+They don't mention it in Pulleman 2021 either, but I suspect that the "Abs_adj" in their equation #1 is adjusted with the DDI blank... otherwise what would it be adjusted for (the paper doesn't specify)?
+
+```{r ddi}
+# rounding ddi mean abs to 3 decimal places b/c that's 
+# the precision we get from the plate reader
+ddi_blanks <- abs_df %>% 
+  filter(str_detect(id, "ddi")) %>% 
+  group_by(plate_id) %>% 
+  summarise(abs_water_blank = round(mean(abs, na.rm = TRUE),3), 
+            .groups = "drop") 
+
+# check out range of ddi blanks 
+# decide if you need to look more closely at any plates
+# update plater templates to remove bad wells
+ddi_blanks %>% 
+  arrange(abs_water_blank) %>% 
+  mutate(plate_id = factor(plate_id), levels = plate_id) %>% 
+  ggplot() + 
+  geom_point(aes(x = plate_id, y = abs_water_blank)) + 
+  coord_flip() +
+  ggtitle("DDI Water Blank Absorbance Values") +
+  theme_bw()
+
+# what is the mean, sd, cv of the ddi_blanks?
+ddi_blanks %>% 
+  summarise(mean_abs = mean(abs_water_blank), 
+            sd_abs = sd(abs_water_blank), 
+            cv_abs = (sd_abs/mean_abs)*100) %>% 
+  mutate(across(.cols = everything()), round(., digits = 3))
+
+
+# join ddi blank values with full dataset
+data_long_w_blanks <- left_join(abs_df, ddi_blanks, by = c("plate_id"))
+
+# subtract ddi blank abs from each well, drop ddi blank rows
+data_adj_long <- data_long_w_blanks %>% 
+  mutate(abs_adj = abs - abs_water_blank) %>% 
+  select(-c(abs, abs_water_blank)) %>% 
+  filter(!id == "ddi_blank")
+
+```
+
+## Reagent Blanks
+
+The reagent blank value isn't used in any of the calculations, I'm including it here simply as a check on different batches of reagent (note that we made a new batch after the 3/31 run).
+
+```{r reagent}
+
+reagent_blanks <- data_adj_long %>% 
+  filter(str_detect(id, "rgt")) %>% 
+  group_by(plate_id) %>% 
+  summarise(mean_abs_rgt = mean(abs_adj, na.rm = TRUE), 
+            .groups = "drop") 
+
+reagent_blanks %>% 
+  summarise(mean_abs = mean(reagent_blanks$mean_abs_rgt), 
+            sd_abs = sd(mean_abs_rgt),
+            cv_abs = (sd_abs/mean_abs)*100) %>% 
+  mutate(across(.cols = everything()), round(x = ., digits = 3)) 
+
+
+  ggplot(data = reagent_blanks) + 
+  geom_point(aes(x = plate_id, y = mean_abs_rgt)) +
+  coord_flip() +
+  ggtitle("Reagent Blank Absorbance Values") +
+    theme_bw()
+
+
+
+```
+
+## Standard curves
+
+### Select std data and calculate avg abs
+
+```{r std-data}
+# std data only, extract KMnO4 conc from sample ids
+std_data <- data_adj_long %>% 
+  filter(str_detect(id, "M_std")) %>% 
+  mutate(id = as.numeric(str_replace(id, "_M_std", ""))) %>% 
+  rename(conc = id) 
+
+# calc avg, sd, cv
+std_data_avg <- std_data %>% 
+  group_by(plate_id, conc) %>% 
+  summarise(mean_abs = mean(abs_adj),
+            sd_abs = sd(abs_adj), 
+            cv_abs = (sd_abs/mean_abs)*100,
+            .groups = "drop")
+
+# are we missing any std data? 
+std_data_avg %>% 
+  filter(is.na(mean_abs)) 
+
+# inspect variability of standard data
+# generally HB found <5% CV
+std_data_avg %>% 
+  ggplot() + 
+  geom_histogram(aes(x = cv_abs), bins = 15) +
+  ggtitle("CV% of absorbance for standard wells") + 
+  labs(subtitle = glue("{nrow(std_data_avg)} observations, n = 3 well replicates each"))
+
+```
+
+### Run linear model and collect model info
+
+Look at the R\^2 values in the table, should be \>=0.99 (or whatever threshold you deem appropriate).
+
+```{r lm}
+
+# create nested structure for modeling
+std_nest <- std_data_avg %>% 
+  nest_by(plate_id)
+
+# run lm on std data for each plate
+# note conc is response var, abs in predictor
+# I originally had these switched around
+models <- std_nest %>% 
+  mutate(model = list(lm(conc ~ mean_abs, data = data)))
+
+# extract model information
+model_stats <- models %>% 
+  mutate(rsq = summary(model)$r.squared, 
+            slope = coef(model)[2], 
+            intercept = coef(model)[1]) %>% 
+  select(-c(data, model))
+
+model_stats
+
+```
+
+### Inspect standard curve results
+
+```{r curves, echo=FALSE}
+
+max_slope <- round(max(model_stats$slope), 4)
+min_slope <- round(min(model_stats$slope), 4)
+
+max_intcpt <- round(max(model_stats$intercept), 4)
+min_intcpt <- round(min(model_stats$intercept), 4)
+
+# look at all the std curves together
+# identify any problem points for further investigation
+ggplot() +
+  geom_point(data = std_data_avg,
+             aes(x = mean_abs, y = conc, color = plate_id),
+             show.legend = FALSE) +
+  geom_abline(data = model_stats, aes(
+    slope = slope,
+    intercept = intercept,
+    color = plate_id
+  ), 
+  show.legend = FALSE) +
+  theme_bw() +
+  ggtitle("Standard Curves") +
+  facet_wrap(vars(plate_id))
+
+# any std curves with R^2 < 0.99?  
+bad_curves <- model_stats %>% 
+  filter(rsq < 0.99)
+
+# if there are any listed here, need to check those plates
+# see if there are obvious bad wells, mark them in template,
+# rerun from beginning
+bad_curves
+
+```
+
+## Calculate avg abs of samples
+
+Calculate the average absorbance for each sample across the 3 well replicates on the plate.
+Join in the linear regression data and soil mass data from above.
+
+```{r avg-abs}
+adj_sample_data <- data_adj_long %>% 
+  filter(!str_detect(id, "M_std")) %>% # drop std data for now
+  group_by(plate_id, id, bad_wells) %>% 
+  summarise(mean_abs = mean(abs_adj), 
+            sd_abs = sd(abs_adj), 
+            cv_abs = ( (sd_abs/mean_abs)*100 ), 
+            .groups = "drop")
+
+
+samples_w_model <- left_join(adj_sample_data,
+                             model_stats,
+                             by = c("plate_id")) %>%
+  select(-rsq) %>% 
+  mutate(run_date = as.numeric(str_extract(plate_id, "[:digit:]{8}")))
+
+
+samples_w_mass <- left_join(samples_w_model, sample_mass, by = c("id", "run_date")) 
+
+
+# missing any mass data?
+samples_w_mass %>% 
+  filter(!str_detect(id, "rgt_blank")) %>% # don't need
+  filter(is.na(mass_kg)) 
+
+# high CV samples? Look more closely at these
+# update bad wells in plater templates for each plate 
+samples_w_mass %>% 
+  filter(cv_abs >10)
+
+```
+
+## Calculate POXC
+
+Active C (mg/kg) = [0.02 mol/L - (a + b \* abs)] \* (9000 mg C /mol) \* (0.02 L solution / mass soil kg)
+
+-   **0.02 mol/L** is the initial solution concentration\
+-   **a** is std curve intercept, **b** is std curve slope, **(a + b \* absorbance)** is the post-reaction concentration\
+-   **9000 mg** of C (0.75 mol) is assumed to be oxidized by 1 mol of MnO4 changing from Mn7+ to Mn2+\
+-   **0.02 L** is the volume of KMnO4 solution reacted with soil (2 mL 0.2M KMnO4 stock + 18 mL DDI = 20mL (0.02L) solution with concentration 0.02M)\
+-   **0.0025 kg** is the weight of soil used (but you should plug in mass from weigh sheets)
+
+```{r calcs}
+
+poxc_calc <- samples_w_mass %>% 
+  mutate(poxc_mg_kg = (0.02 - (intercept + (mean_abs * slope))) * 9000 * (0.02/mass_kg))
+
+
+#add full sample names
+named_poxc_calc <- left_join(poxc_calc, names, by = "id") %>%
+  filter(id != "rgt_blank") %>% 
+  select(-c(
+    bad_wells,
+    contains("abs"),
+    slope,
+    intercept
+  ))
+
+# save
+write_csv(named_poxc_calc, glue("./results/poxc_calculations_{today}.csv"))
+
+```
