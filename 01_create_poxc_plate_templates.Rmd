@@ -11,7 +11,7 @@ This R Markdown document takes (1) absorbance data from the plate reader and (2)
 
 To start:
 
-(1) save absorbance data from plate reader as .xlsx files in raw_data dir
+(1) save absorbance data from plate reader as .xlsx files in raw_data dir. **NOTE** each tab/sheet in your Excel document must be named after the exact plate name as it appears in your `plate_maps.csv` file below. This name is used to join the absorbance data to the correct names.
 
 (2) Type up plate maps as shown in "raw_data/plate_maps.csv".
     All maps in 1 file.
@@ -257,3 +257,7 @@ walk(paths_to_abs_data, make_poxc_plater_temp)
 -   Go to your lab notebook, review notes, and mark "bad" wells in the plater templates you just created (can mark with any text: X, bad well, x, etc.). Save the updated templates.
 -   Be careful if you are testing / running this multiple times with the same input file that you don't overwrite templates you've edited by hand with new blank ones made by this script.
 -   Go to `02_poxc_calculation.Rmd`.
+
+## Troubleshooting 
+
+- Made a template, but your plate maps are missing? Double check that the names of the tabs in your absorbance data Excel file **exactly match** the `plate_maps.csv` 
